@@ -16,6 +16,8 @@ Keep this current: what was tried, what it measured, what was submitted. Newest 
 
 | When (EST) | Commit | Dev check | Practice result | Practice time (s) | Notes |
 | --- | --- | --- | --- | --- | --- |
+| Sun 9:37 AM | 6798d8c (v1) | pass | Scored, correct | **9.0420** | local warm 2.23 s: scorer ~4x slower than this box |
+| Sun ~9:45 AM | 3e83ac5 (v3.1) | | requested | | |
 
 ## Local timings
 

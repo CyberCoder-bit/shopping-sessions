@@ -643,21 +643,29 @@ fn run() -> Result<()> {
 
     // Merge and write.
     let mut camp = vec![[0i64; 4]; (n_camp + 1) * ndays];
-    let mut rows: Vec<URow> = Vec::with_capacity(accs.iter().map(|a| a.rows.len()).sum());
+    // One user_daily part file per session thread: no single-threaded merge of the rows.
+    let mut row_parts: Vec<Vec<URow>> = Vec::with_capacity(accs.len());
     for acc in accs {
         for (total, cell) in camp.iter_mut().zip(&acc.camp) {
             for x in 0..4 {
                 total[x] += cell[x];
             }
         }
-        rows.extend(acc.rows);
+        row_parts.push(acc.rows);
     }
-    let cat_names: Vec<ByteArray> = lk.cats.iter().map(|c| ByteArray::from(c.clone())).collect();
-    let per = rows.len().div_ceil(ncpu).max(1);
-    let parts: Vec<&[URow]> = if rows.is_empty() { vec![&rows[..]] } else { rows.chunks(per).collect() };
-    let errors = par::parallel_for(ncpu, parts.len(), || None, |err: &mut Option<String>, i| {
-        let part = parts[i];
+    let n_rows: usize = row_parts.iter().map(Vec::len).sum();
+    let errors = par::parallel_for(ncpu, row_parts.len(), || None, |err: &mut Option<String>, i| {
+        // Per-task category values: cloning a shared ByteArray bumps one atomic refcount
+        // from every thread.
+        let cat_names: Vec<ByteArray> = lk.cats.iter().map(|c| ByteArray::from(c.clone())).collect();
+        let part = &row_parts[i];
         let mut t = UserDaily::default();
+        t.user_id.reserve(part.len());
+        t.day.reserve(part.len());
+        t.sessions.reserve(part.len());
+        t.events.reserve(part.len());
+        t.revenue_cents.reserve(part.len());
+        t.top_category.reserve(part.len());
         for r in part {
             t.user_id.push(ByteArray::from(keys::to_vec(r.person)));
             t.day.push(r.day);
@@ -696,6 +704,6 @@ fn run() -> Result<()> {
         }
     }
     output::write_campaign_daily(&out, "part-000.parquet", &t)?;
-    lap(&format!("wrote user_daily {} rows, campaign_daily {} rows", rows.len(), t.day.len()));
+    lap(&format!("wrote user_daily {n_rows} rows, campaign_daily {} rows", t.day.len()));
     Ok(())
 }
