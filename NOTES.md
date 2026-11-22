@@ -4,6 +4,7 @@ Keep this current: what was tried, what it measured, what was submitted. Newest 
 
 ## Status
 
+- 2026-11-22 10:17: **v9** (91565fd) = final candidate; full Docker gate green, 30M scale test SELFCHECK OK at 4.7 GB peak (~9.5 GB projected at 60M). bench 20M native 1.12-1.36 s on a quiet box. Submitted as #3.
 - 2026-11-22 10:05: **v8** (2e81c02) gate green, pushed; requested as submission #3. Since v3.1: per-thread output parts + per-task category ByteArrays (write 0.14 -> 0.055 s), counting-sort grouping by person (sessions 0.255 -> 0.22 s), union-find prefetch, MADV_DONTNEED on parsed inputs, GLIBC_TUNABLES mmap_threshold=32MB/trim_threshold=4GB (median 1.47 -> 1.37 s, 6/7 pairs). bench 20M native ~1.3-1.4 s on a quiet box.
 - 2026-11-22 09:40: **v3.1** (33c5e15...) gate green. bench 20M native ~1.4-1.6 s (noisy box), Docker 1.63 s in-container. Pushed for submission #3.
 - 2026-11-22 09:28: **v2** (d0820ab) gate green, pushed. Submission #2 candidate.
@@ -19,7 +20,7 @@ Keep this current: what was tried, what it measured, what was submitted. Newest 
 | --- | --- | --- | --- | --- | --- |
 | Sun 9:37 AM | 6798d8c (v1) | pass | Scored, correct | **9.0420** | local warm 2.23 s: scorer ~4x slower than this box |
 | Sun ~9:45 AM | 3e83ac5 (v3.1) | | requested | | |
-| Sun ~10:37 AM | 2e81c02 (v8) | | requested | | next slot |
+| Sun ~10:20 AM | 91565fd (v9) | | requested (replaces v8) | | final candidate |
 
 ## Local timings
 
@@ -39,6 +40,8 @@ Keep this current: what was tried, what it measured, what was submitted. Newest 
 
 ## Decisions
 
+- Rejected late: moving click parsing into phase 1 (v10: steals CPU from the links thread, the critical path; 2/6 pairs), two-pass union-find (v10c: no clear gain).
+- Links thread (~0.45 s, union-find ~0.35 s of it) is the phase-1 critical path in v9; next idea would be THP-backed FlatMap or a smaller table with growth.
 - Rejected: date cache in parse_ts (events are shuffled, saving would be ~10 ms); RawEv 64->48 B bit-packing (~2-3%, not worth the risk late).
 - The scorer is ~4x slower than this box (v1: 2.23 s local -> 9.04 s scored) and looks CPU-bound: cut CPU, not wall.
 - Tried and rejected: mimalloc (sys time 3-23 s, slower), GLIBC_TUNABLES=glibc.malloc.hugetlb=1 (no gain), per-thread reuse of dedup map + concat buffers (no measurable gain).
