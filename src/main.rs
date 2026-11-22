@@ -229,7 +229,8 @@ fn find(parent: &mut [u32], mut x: u32) -> u32 {
 /// Union-find over all link pairs; each ID's person is the byte-wise smallest ID of its set.
 fn build_persons(pairs: &[(u128, u128)]) -> Persons {
     // One flat table: value = dense id during union-find, then the person's name.
-    let mut map = FlatMap::with_capacity(2 * pairs.len() + 16);
+    // Distinct IDs <= 2 * pairs, and capacity = next_pow2(2 * n) >= 3 * pairs: load <= 2/3.
+    let mut map = FlatMap::with_capacity(pairs.len() * 3 / 2 + 16);
     let mut keys_of: Vec<u128> = Vec::with_capacity(pairs.len() + 16);
     let mut parent: Vec<u32> = Vec::with_capacity(pairs.len() + 16);
     let mut size: Vec<u32> = Vec::with_capacity(pairs.len() + 16);
