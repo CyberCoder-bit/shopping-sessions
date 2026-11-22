@@ -329,17 +329,6 @@ fn take<T>(slot: &Mutex<Vec<Vec<T>>>) -> Vec<Vec<T>> {
     std::mem::take(&mut *slot.lock().unwrap())
 }
 
-fn concat<T: Copy>(mut pieces: Vec<Vec<T>>) -> Vec<T> {
-    if pieces.len() == 1 {
-        return pieces.pop().unwrap();
-    }
-    let mut all = Vec::with_capacity(pieces.iter().map(Vec::len).sum());
-    for piece in pieces {
-        all.extend_from_slice(&piece);
-    }
-    all
-}
-
 struct URow {
     person: u128,
     day: i32,
@@ -463,6 +452,100 @@ impl Acc {
         }
         self.flush(person, cur_day, day_sessions, day_events, day_revenue);
     }
+}
+
+const NO_EV: Ev = Ev { person: 0, ts: 0, price: 0, cat: 0, purchase: false };
+const NO_CLICK: Click = Click { person: 0, ck: 0, ts: 0, camp: 0 };
+
+/// Groups one partition's events and clicks by person with a counting sort over a dense
+/// per-partition person index, then sorts each (small) group: events by ts, clicks by ts
+/// asc then click_id desc. Group k of `evs` is `evs[ev_start[k]..ev_start[k + 1]]`, and its
+/// clicks are `cls[ck_start[k]..ck_start[k + 1]]`. Clicks of persons with no event are
+/// dropped (they can't credit or assist anything). Buffers are reused across partitions.
+#[derive(Default)]
+struct Grouper {
+    ids: KeyMap<u32>,
+    idx: Vec<u32>,
+    cursor: Vec<usize>,
+    ev_start: Vec<usize>,
+    evs: Vec<Ev>,
+    ck_start: Vec<usize>,
+    cls: Vec<Click>,
+}
+
+impl Grouper {
+    fn group(&mut self, ev_pieces: Vec<Vec<Ev>>, ck_pieces: Vec<Vec<Click>>) {
+        // Events: dense ids in first-seen order, counts, then scatter.
+        self.ids.clear();
+        self.idx.clear();
+        self.ev_start.clear();
+        for e in ev_pieces.iter().flatten() {
+            let next = self.ev_start.len() as u32;
+            let id = *self.ids.entry(e.person).or_insert(next);
+            if id == next {
+                self.ev_start.push(0);
+            }
+            self.ev_start[id as usize] += 1;
+            self.idx.push(id);
+        }
+        let n = self.ev_start.len();
+        let total = prefix_sums(&mut self.ev_start);
+        self.cursor.clear();
+        self.cursor.extend_from_slice(&self.ev_start[..n]);
+        self.evs.clear();
+        self.evs.resize(total, NO_EV);
+        for (e, &id) in ev_pieces.iter().flatten().zip(&self.idx) {
+            let at = &mut self.cursor[id as usize];
+            self.evs[*at] = *e;
+            *at += 1;
+        }
+        drop(ev_pieces);
+        for k in 0..n {
+            self.evs[self.ev_start[k]..self.ev_start[k + 1]].sort_unstable_by_key(|e| e.ts);
+        }
+
+        // Clicks: same ids; persons without events are skipped.
+        self.idx.clear();
+        self.ck_start.clear();
+        self.ck_start.resize(n, 0);
+        for c in ck_pieces.iter().flatten() {
+            let id = self.ids.get(&c.person).copied().unwrap_or(u32::MAX);
+            if id != u32::MAX {
+                self.ck_start[id as usize] += 1;
+            }
+            self.idx.push(id);
+        }
+        let total = prefix_sums(&mut self.ck_start);
+        self.cursor.clear();
+        self.cursor.extend_from_slice(&self.ck_start[..n]);
+        self.cls.clear();
+        self.cls.resize(total, NO_CLICK);
+        for (c, &id) in ck_pieces.iter().flatten().zip(&self.idx) {
+            if id != u32::MAX {
+                let at = &mut self.cursor[id as usize];
+                self.cls[*at] = *c;
+                *at += 1;
+            }
+        }
+        drop(ck_pieces);
+        for k in 0..n {
+            self.cls[self.ck_start[k]..self.ck_start[k + 1]]
+                .sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| key_cmp(b.ck, a.ck)));
+        }
+    }
+}
+
+/// Turns counts into start offsets in place and appends the total (so `v[k]..v[k + 1]`
+/// is group k). Returns the total.
+fn prefix_sums(v: &mut Vec<usize>) -> usize {
+    let mut total = 0;
+    for c in v.iter_mut() {
+        let count = *c;
+        *c = total;
+        total += count;
+    }
+    v.push(total);
+    total
 }
 
 fn run() -> Result<()> {
@@ -616,29 +699,16 @@ fn run() -> Result<()> {
     let d0 = lk.ws.div_euclid(DAY_MS);
     let ndays = ((lk.we - 1).div_euclid(DAY_MS) - d0 + 1).max(1) as usize;
     let ncat = lk.cats.len();
-    let accs = par::parallel_for(ncpu, P, || Acc::new(n_camp + 1, ndays, ncat), |acc, p| {
-        let mut evs = concat(take(&ev_parts[p]));
-        let mut cls = concat(take(&ck_parts[p]));
-        evs.sort_unstable_by(|a, b| a.person.cmp(&b.person).then(a.ts.cmp(&b.ts)));
-        cls.sort_unstable_by(|a, b| a.person.cmp(&b.person).then(a.ts.cmp(&b.ts)).then_with(|| key_cmp(b.ck, a.ck)));
-        let (mut i, mut ci) = (0usize, 0usize);
-        while i < evs.len() {
-            let person = evs[i].person;
-            let mut j = i + 1;
-            while j < evs.len() && evs[j].person == person {
-                j += 1;
-            }
-            while ci < cls.len() && cls[ci].person < person {
-                ci += 1;
-            }
-            let c0 = ci;
-            while ci < cls.len() && cls[ci].person == person {
-                ci += 1;
-            }
-            acc.person(&evs[i..j], &cls[c0..ci], d0, organic);
-            i = j;
+    let accs = par::parallel_for(ncpu, P, || (Acc::new(n_camp + 1, ndays, ncat), Grouper::default()), |state, p| {
+        let (acc, g) = state;
+        g.group(take(&ev_parts[p]), take(&ck_parts[p]));
+        for k in 0..g.ev_start.len() - 1 {
+            let evs = &g.evs[g.ev_start[k]..g.ev_start[k + 1]];
+            let cls = &g.cls[g.ck_start[k]..g.ck_start[k + 1]];
+            acc.person(evs, cls, d0, organic);
         }
     });
+    let accs: Vec<Acc> = accs.into_iter().map(|(acc, _)| acc).collect();
     lap("sessions");
 
     // Merge and write.
