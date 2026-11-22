@@ -9,7 +9,6 @@ use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 
 use memchr::{memchr, memchr_iter};
-use memmap2::Mmap;
 
 /// Every `*.csv` file directly in `dir`, sorted. A missing dir has no files.
 pub fn list_csv(dir: &Path) -> Vec<PathBuf> {
@@ -26,50 +25,92 @@ pub fn list_csv(dir: &Path) -> Vec<PathBuf> {
     files
 }
 
-/// Memory-maps every non-empty file (an empty file has no lines at all).
-pub fn map_files(paths: &[PathBuf]) -> std::io::Result<Vec<Mmap>> {
-    let mut maps = Vec::with_capacity(paths.len());
+/// An input file opened for positional reads.
+pub struct InFile {
+    pub file: File,
+    pub size: u64,
+}
+
+/// Opens every non-empty file (an empty file has no lines at all).
+pub fn open_files(paths: &[PathBuf]) -> std::io::Result<Vec<InFile>> {
+    let mut out = Vec::with_capacity(paths.len());
     for path in paths {
         let file = File::open(path)?;
-        if file.metadata()?.len() == 0 {
-            continue;
+        let size = file.metadata()?.len();
+        if size > 0 {
+            out.push(InFile { file, size });
         }
-        // SAFETY: /data is read-only and nothing modifies the files while we run.
-        maps.push(unsafe { Mmap::map(&file)? });
     }
-    Ok(maps)
+    Ok(out)
 }
 
-pub struct Chunk {
+/// A byte range of one file; it owns the lines that *start* inside it.
+pub struct Span {
     pub file: usize,
-    pub start: usize,
-    pub end: usize,
+    pub start: u64,
+    pub end: u64,
 }
 
-/// Splits every file's data lines (after the header) into chunks of about `target`
-/// bytes that start and end on line boundaries. Largest chunks first.
-pub fn chunks(maps: &[Mmap], target: usize) -> Vec<Chunk> {
+/// Cuts every file into spans of `target` bytes, largest first.
+pub fn spans(files: &[InFile], target: u64) -> Vec<Span> {
     let mut out = Vec::new();
-    for (file, map) in maps.iter().enumerate() {
-        let data: &[u8] = map;
-        let Some(header_end) = memchr(b'\n', data) else {
-            continue; // header only, no data lines
-        };
-        let mut start = header_end + 1;
-        while start < data.len() {
-            let mut end = (start + target).min(data.len());
-            if end < data.len() {
-                end = match memchr(b'\n', &data[end..]) {
-                    Some(at) => end + at + 1,
-                    None => data.len(),
-                };
-            }
-            out.push(Chunk { file, start, end });
+    for (file, f) in files.iter().enumerate() {
+        let mut start = 0;
+        while start < f.size {
+            let end = (start + target).min(f.size);
+            out.push(Span { file, start, end });
             start = end;
         }
     }
-    out.sort_by_key(|c| std::cmp::Reverse(c.end - c.start));
+    out.sort_by_key(|s| std::cmp::Reverse(s.end - s.start));
     out
+}
+
+/// Reads span `sp` with one `pread` into `buf` (reused across calls) and returns the whole
+/// lines that start inside it: the file's first line (the header) is never returned, a
+/// line that starts before the span belongs to the previous span, and the last line may
+/// run past the span's end (more is read if it runs past the slack).
+pub fn load_span<'b>(f: &InFile, sp: &Span, buf: &'b mut Vec<u8>) -> std::io::Result<&'b [u8]> {
+    use std::os::unix::fs::FileExt;
+    // From start-1 (or 0): a line starts at `start` iff the byte before it is '\n'. For
+    // the first span, the first '\n' ends the header. Either way the span's lines begin
+    // right after the first '\n' in the buffer.
+    let from = sp.start.saturating_sub(1);
+    let mut slack: u64 = 64 << 10;
+    loop {
+        let to = (sp.end + slack).min(f.size);
+        let len = (to - from) as usize;
+        if buf.len() < len {
+            buf.resize(len, 0);
+        }
+        f.file.read_exact_at(&mut buf[..len], from)?;
+        let data = &buf[..len];
+        let at_eof = to == f.size;
+        // Index of the span's end inside `data`.
+        let end_idx = (sp.end - from) as usize;
+        let Some(nl) = memchr(b'\n', data) else {
+            if at_eof {
+                return Ok(&[]); // the line in progress started before this span
+            }
+            slack *= 4;
+            continue;
+        };
+        let first = nl + 1;
+        if first >= end_idx {
+            return Ok(&[]); // no line starts inside this span
+        }
+        // The last line starting inside the span contains byte end_idx-1 and ends at the
+        // first '\n' at or after it.
+        let stop = match memchr(b'\n', &data[end_idx - 1..]) {
+            Some(at) => end_idx - 1 + at + 1,
+            None if at_eof => len,
+            None => {
+                slack *= 4;
+                continue;
+            }
+        };
+        return Ok(&buf[first..stop]);
+    }
 }
 
 /// Calls `f` for every line of `data` (without its `\n`), including a last line with
@@ -261,6 +302,41 @@ mod tests {
         let mut b: Vec<[Vec<u8>; N]> = Vec::new();
         for_each_record::<N>(data, |f| b.push((*f).map(|x| x.to_vec())));
         assert_eq!(a, b, "{:?}", String::from_utf8_lossy(data));
+    }
+
+    #[test]
+    fn spans_cover_every_line_once() {
+        let dir = std::env::temp_dir().join(format!("ss-span-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for case in 0..300 {
+            let len = (next() % 3000) as usize;
+            let data: Vec<u8> = (0..len).map(|_| if next() % 9 == 0 { b'\n' } else { b'a' + (next() % 3) as u8 }).collect();
+            let path = dir.join(format!("f{case}.csv"));
+            std::fs::write(&path, &data).unwrap();
+            let files = open_files(&[path]).unwrap();
+            let expected: Vec<u8> = match memchr(b'\n', &data) {
+                Some(h) => data[h + 1..].to_vec(),
+                None => Vec::new(),
+            };
+            for target in [1u64, 2, 3, 7, 64, 100, 1000, 5000] {
+                let mut sp = spans(&files, target);
+                sp.sort_by_key(|s| s.start);
+                let mut buf = Vec::new();
+                let mut got = Vec::new();
+                for s in &sp {
+                    got.extend_from_slice(load_span(&files[s.file], s, &mut buf).unwrap());
+                }
+                assert_eq!(got, expected, "case {case} target {target}");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

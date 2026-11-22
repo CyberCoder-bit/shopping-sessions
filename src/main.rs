@@ -23,7 +23,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Instant;
 
-use memmap2::{Advice, Mmap};
 use parquet::data_type::ByteArray;
 
 use keys::{key_cmp, key_map, pack, part_of, FlatMap, KeyMap, P};
@@ -552,17 +551,6 @@ fn prefix_sums(v: &mut Vec<usize>) -> usize {
     total
 }
 
-/// Drops the pages of fully parsed input mappings, in parallel (MADV_DONTNEED only takes
-/// the mmap lock for reading), so the serial teardown at exit has less to unmap. Nothing
-/// points into these mappings afterwards: parsed records hold packed keys, not slices.
-fn release(ncpu: usize, maps: &[Mmap]) {
-    par::parallel_for(ncpu, maps.len(), || (), |_, i| {
-        // SAFETY: the mapping is private and read-only, and is never read again; if it
-        // were, the pages would simply fault back in from the page cache.
-        let _ = unsafe { maps[i].unchecked_advise(memmap2::UncheckedAdvice::DontNeed) };
-    });
-}
-
 fn run() -> Result<()> {
     let t0 = Instant::now();
     let lap = |what: &str| eprintln!("[{:8.3}s] {what}", t0.elapsed().as_secs_f64());
@@ -574,27 +562,25 @@ fn run() -> Result<()> {
         .filter(|&n| n > 0)
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, usize::from));
 
-    let ev_maps = csv::map_files(&csv::list_csv(&data.join("events")))?;
-    let ck_maps = csv::map_files(&csv::list_csv(&data.join("clicks")))?;
-    let ln_maps = csv::map_files(&csv::list_csv(&data.join("links")))?;
-    for m in ln_maps.iter().chain(&ev_maps).chain(&ck_maps) {
-        let _ = m.advise(Advice::WillNeed);
-    }
-    let bytes = |maps: &[Mmap]| maps.iter().map(|m| m.len()).sum::<usize>();
-    let (ev_bytes, ck_bytes) = (bytes(&ev_maps), bytes(&ck_maps));
+    let ev_files = csv::open_files(&csv::list_csv(&data.join("events")))?;
+    let ck_files = csv::open_files(&csv::list_csv(&data.join("clicks")))?;
+    let ln_paths = csv::list_csv(&data.join("links"));
+    let bytes = |files: &[csv::InFile]| files.iter().map(|f| f.size as usize).sum::<usize>();
+    let (ev_bytes, ck_bytes) = (bytes(&ev_files), bytes(&ck_files));
     let lk = load_lookups(&data)?;
     lap(&format!("lookups: ncpu={ncpu} events {} files {} MB, clicks {} files {} MB, links {} files",
-        ev_maps.len(), ev_bytes >> 20, ck_maps.len(), ck_bytes >> 20, ln_maps.len()));
+        ev_files.len(), ev_bytes >> 20, ck_files.len(), ck_bytes >> 20, ln_paths.len()));
 
     // Links -> persons on their own thread (small, single-threaded union-find), while all
     // NCPU threads parse events: event parsing doesn't need persons, only dedup does.
-    let ev_chunks = csv::chunks(&ev_maps, CHUNK);
+    let ev_chunks = csv::spans(&ev_files, CHUNK as u64);
     let cap = ev_bytes / 70 / (ncpu * P) * 5 / 4 + 16;
     let (persons, raw) = std::thread::scope(|scope| {
         let links = scope.spawn(|| {
             let mut pairs: Vec<(u128, u128)> = Vec::new();
-            for map in &ln_maps {
-                let Some(header_end) = memchr::memchr(b'\n', map) else { continue };
+            for path in &ln_paths {
+                let map = fs::read(path).expect("read links file");
+                let Some(header_end) = memchr::memchr(b'\n', &map) else { continue };
                 csv::for_each_record::<2>(&map[header_end + 1..], |&[a, b]| {
                     if !a.is_empty() && !b.is_empty() {
                         pairs.push((pack(a), pack(b)));
@@ -605,9 +591,11 @@ fn run() -> Result<()> {
             lap(&format!("links thread done: {} pairs", pairs.len()));
             persons
         });
-        let raw = par::parallel_for(ncpu, ev_chunks.len(), || new_bufs::<RawEv>(cap), |bufs, t| {
+        let raw = par::parallel_for(ncpu, ev_chunks.len(), || (new_bufs::<RawEv>(cap), Vec::new()), |state, t| {
+            let (bufs, buf) = state;
             let c = &ev_chunks[t];
-            csv::for_each_record::<7>(&ev_maps[c.file][c.start..c.end], |f| {
+            let lines = csv::load_span(&ev_files[c.file], c, buf).expect("read events file");
+            csv::for_each_record::<7>(lines, |f| {
                 if f[0].is_empty() {
                     return;
                 }
@@ -620,8 +608,7 @@ fn run() -> Result<()> {
         });
         (links.join().expect("links thread panicked"), raw)
     });
-    let raw_parts = transpose(raw);
-    release(ncpu, &ev_maps);
+    let raw_parts = transpose(raw.into_iter().map(|(bufs, _)| bufs).collect());
     lap(&format!("events parsed; links: {} linked ids", persons.len));
 
     // Dedup per event_id partition: keep the min-ingest copy, then drop it if invalid.
@@ -678,14 +665,15 @@ fn run() -> Result<()> {
     lap("events deduped");
 
     // Clicks: parse + validate, partitioned by person. (Copies are identical, so no dedup.)
-    let ck_chunks = csv::chunks(&ck_maps, CHUNK);
+    let ck_chunks = csv::spans(&ck_files, CHUNK as u64);
     let ck_cap = ck_bytes / 45 / (ncpu * P) * 5 / 4 + 16;
     let click_window_start = lk.ws - WEEK_MS;
-    let clicks = par::parallel_for(ncpu, ck_chunks.len(), || (new_bufs::<Click>(ck_cap), Vec::new()), |state, t| {
-        let (bufs, batch): &mut (Vec<Vec<Click>>, Vec<Click>) = state;
+    let clicks = par::parallel_for(ncpu, ck_chunks.len(), || (new_bufs::<Click>(ck_cap), Vec::new(), Vec::new()), |state, t| {
+        let (bufs, batch, buf): &mut (Vec<Vec<Click>>, Vec<Click>, Vec<u8>) = state;
         let c = &ck_chunks[t];
         batch.clear();
-        csv::for_each_record::<4>(&ck_maps[c.file][c.start..c.end], |&[cid, uid, camp, tsf]| {
+        let lines = csv::load_span(&ck_files[c.file], c, buf).expect("read clicks file");
+        csv::for_each_record::<4>(lines, |&[cid, uid, camp, tsf]| {
             if cid.is_empty() || uid.is_empty() {
                 return;
             }
@@ -705,9 +693,8 @@ fn run() -> Result<()> {
             bufs[part_of(click.person)].push(click);
         }
     });
-    let clicks: Vec<Vec<Vec<Click>>> = clicks.into_iter().map(|(bufs, _)| bufs).collect();
+    let clicks: Vec<Vec<Vec<Click>>> = clicks.into_iter().map(|(bufs, _, _)| bufs).collect();
     let ck_parts = transpose(clicks);
-    release(ncpu, &ck_maps);
     lap("clicks parsed");
 
     // Sessions, credit and assists per person partition.
