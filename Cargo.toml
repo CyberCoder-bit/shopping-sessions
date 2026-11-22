@@ -1,0 +1,28 @@
+[package]
+name = "shopping-sessions"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+publish = false
+
+[[bin]]
+name = "pipeline"
+path = "src/main.rs"
+
+[dependencies]
+# Low-level Parquet writer only (no arrow), to keep the build small and fast.
+parquet = { version = "60", default-features = false }
+memmap2 = "0.9"
+memchr = "2"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+debug = false
+
+# `cargo build --profile profiling` keeps symbols for perf / flamegraph.
+[profile.profiling]
+inherits = "release"
+debug = true

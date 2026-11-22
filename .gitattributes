@@ -1,0 +1,3 @@
+# Fixture bytes are test data (E20 has literal \r): never convert line endings.
+fixtures/** -text
+*.csv -text

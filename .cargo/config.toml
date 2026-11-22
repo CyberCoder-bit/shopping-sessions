@@ -1,0 +1,5 @@
+# x86-64-v3 = AVX2/BMI2/FMA. Runs on the scorers (Cascade Lake or newer, which also
+# have AVX-512) and on the local dev box (Core Ultra 9 275HX: AVX2, no AVX-512).
+# Do NOT raise this to x86-64-v4 / cascadelake: local runs would SIGILL.
+[build]
+rustflags = ["-C", "target-cpu=x86-64-v3"]

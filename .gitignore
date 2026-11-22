@@ -1,0 +1,27 @@
+# Build outputs
+/target/
+/tools/generator/target/
+/bin/
+
+# Data and answers: never commit (repo must stay <= 50 MB, no data checked in)
+/dev/
+/bench/
+/data/
+/seeds/
+/out/
+/out-*/
+/dev-answer/
+*.parquet
+
+# Organizer downloads (starters, generator.zip, dev-answer.zip) kept locally for reference
+/ref/
+
+# Local env / tool state
+/.venv/
+__pycache__/
+*.pyc
+*:Zone.Identifier
+recipes.json
+perf.data*
+flamegraph.svg
+.claude/settings.local.json
