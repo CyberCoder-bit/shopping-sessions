@@ -26,7 +26,7 @@ use std::time::Instant;
 use memmap2::{Advice, Mmap};
 use parquet::data_type::ByteArray;
 
-use keys::{key_cmp, key_map, pack, part_of, KeyMap, P};
+use keys::{key_cmp, key_map, pack, part_of, FlatMap, KeyMap, P};
 use output::{CampaignDaily, Result, UserDaily};
 use ts::{parse_ts, DAY_MS};
 
@@ -94,20 +94,26 @@ impl Lookups {
     }
 }
 
+/// Every linked ID -> its person's name (the smallest ID of its set). One lookup, one key.
 struct Persons {
-    index: KeyMap<u32>,
-    person_of: Vec<u128>,
+    map: FlatMap,
+    len: usize,
 }
 
 impl Persons {
     #[inline]
     fn resolve(&self, user: u128) -> u128 {
-        match self.index.get(&user) {
-            Some(&i) => self.person_of[i as usize],
-            None => user,
-        }
+        self.map.get(user).unwrap_or(user)
+    }
+
+    #[inline]
+    fn prefetch(&self, user: u128) {
+        self.map.prefetch(user);
     }
 }
+
+/// How far ahead person lookups are prefetched.
+const AHEAD: usize = 16;
 
 fn env_path(name: &str, default: &str) -> PathBuf {
     std::env::var_os(name).map_or_else(|| PathBuf::from(default), PathBuf::from)
@@ -221,32 +227,31 @@ fn find(parent: &mut [u32], mut x: u32) -> u32 {
 }
 
 /// Union-find over all link pairs; each ID's person is the byte-wise smallest ID of its set.
-fn build_persons(pairs: Vec<Vec<(u128, u128)>>) -> Persons {
-    let n_pairs: usize = pairs.iter().map(Vec::len).sum();
-    let mut index: KeyMap<u32> = key_map(n_pairs + 16);
-    let mut keys_of: Vec<u128> = Vec::with_capacity(n_pairs + 16);
-    let mut parent: Vec<u32> = Vec::with_capacity(n_pairs + 16);
-    let mut size: Vec<u32> = Vec::with_capacity(n_pairs + 16);
+fn build_persons(pairs: &[(u128, u128)]) -> Persons {
+    // One flat table: value = dense id during union-find, then the person's name.
+    let mut map = FlatMap::with_capacity(2 * pairs.len() + 16);
+    let mut keys_of: Vec<u128> = Vec::with_capacity(pairs.len() + 16);
+    let mut parent: Vec<u32> = Vec::with_capacity(pairs.len() + 16);
+    let mut size: Vec<u32> = Vec::with_capacity(pairs.len() + 16);
     let mut id_of = |k: u128, keys_of: &mut Vec<u128>, parent: &mut Vec<u32>, size: &mut Vec<u32>| -> u32 {
-        *index.entry(k).or_insert_with(|| {
-            let id = keys_of.len() as u32;
+        let next = keys_of.len() as u32;
+        let id = map.get_or_insert(k, next as u128) as u32;
+        if id == next {
             keys_of.push(k);
             parent.push(id);
             size.push(1);
-            id
-        })
+        }
+        id
     };
-    for chunk in &pairs {
-        for &(a, b) in chunk {
-            let ia = id_of(a, &mut keys_of, &mut parent, &mut size);
-            let ib = id_of(b, &mut keys_of, &mut parent, &mut size);
-            let ra = find(&mut parent, ia);
-            let rb = find(&mut parent, ib);
-            if ra != rb {
-                let (big, small) = if size[ra as usize] >= size[rb as usize] { (ra, rb) } else { (rb, ra) };
-                parent[small as usize] = big;
-                size[big as usize] += size[small as usize];
-            }
+    for &(a, b) in pairs {
+        let ia = id_of(a, &mut keys_of, &mut parent, &mut size);
+        let ib = id_of(b, &mut keys_of, &mut parent, &mut size);
+        let ra = find(&mut parent, ia);
+        let rb = find(&mut parent, ib);
+        if ra != rb {
+            let (big, small) = if size[ra as usize] >= size[rb as usize] { (ra, rb) } else { (rb, ra) };
+            parent[small as usize] = big;
+            size[big as usize] += size[small as usize];
         }
     }
     let n = keys_of.len();
@@ -257,8 +262,10 @@ fn build_persons(pairs: Vec<Vec<(u128, u128)>>) -> Persons {
             name[r] = keys_of[i];
         }
     }
-    let person_of = (0..n).map(|i| name[find(&mut parent, i as u32) as usize]).collect();
-    Persons { index, person_of }
+    for v in map.values_mut() {
+        *v = name[find(&mut parent, *v as u32) as usize];
+    }
+    Persons { map, len: n }
 }
 
 /// `price_cents` of a purchase: ASCII digits only, value 1..=10,000,000.
@@ -480,46 +487,58 @@ fn run() -> Result<()> {
     lap(&format!("lookups: ncpu={ncpu} events {} files {} MB, clicks {} files {} MB, links {} files",
         ev_maps.len(), ev_bytes >> 20, ck_maps.len(), ck_bytes >> 20, ln_maps.len()));
 
-    // Links -> persons.
-    let ln_chunks = csv::chunks(&ln_maps, CHUNK);
-    let pairs = par::parallel_for(ncpu, ln_chunks.len(), Vec::new, |v: &mut Vec<(u128, u128)>, t| {
-        let c = &ln_chunks[t];
-        csv::for_each_line(&ln_maps[c.file][c.start..c.end], |line| {
-            if let Some([a, b]) = csv::split_fields::<2>(line) {
-                if !a.is_empty() && !b.is_empty() {
-                    v.push((pack(a), pack(b)));
-                }
-            }
-        });
-    });
-    let persons = build_persons(pairs);
-    lap(&format!("links: {} linked ids", persons.person_of.len()));
-
-    // Events: parse + validate every copy, partitioned by event_id.
+    // Links -> persons on their own thread (small, single-threaded union-find), while all
+    // NCPU threads parse events: event parsing doesn't need persons, only dedup does.
     let ev_chunks = csv::chunks(&ev_maps, CHUNK);
     let cap = ev_bytes / 70 / (ncpu * P) * 5 / 4 + 16;
-    let raw = par::parallel_for(ncpu, ev_chunks.len(), || new_bufs::<RawEv>(cap), |bufs, t| {
-        let c = &ev_chunks[t];
-        csv::for_each_line(&ev_maps[c.file][c.start..c.end], |line| {
-            let Some(f) = csv::split_fields::<7>(line) else { return };
-            if f[0].is_empty() {
-                return;
+    let (persons, raw) = std::thread::scope(|scope| {
+        let links = scope.spawn(|| {
+            let mut pairs: Vec<(u128, u128)> = Vec::new();
+            for map in &ln_maps {
+                let Some(header_end) = memchr::memchr(b'\n', map) else { continue };
+                csv::for_each_line(&map[header_end + 1..], |line| {
+                    if let Some([a, b]) = csv::split_fields::<2>(line) {
+                        if !a.is_empty() && !b.is_empty() {
+                            pairs.push((pack(a), pack(b)));
+                        }
+                    }
+                });
             }
-            let ek = pack(f[0]);
-            let ingest = parse_ts(f[3]).unwrap_or(i64::MAX);
-            let mut r = RawEv { ek, user: 0, ingest, ts: 0, price: 0, cat: 0, kind: 0 };
-            validate_event(&mut r, &f, &lk);
-            bufs[part_of(ek)].push(r);
+            let persons = build_persons(&pairs);
+            lap(&format!("links thread done: {} pairs", pairs.len()));
+            persons
         });
+        let raw = par::parallel_for(ncpu, ev_chunks.len(), || new_bufs::<RawEv>(cap), |bufs, t| {
+            let c = &ev_chunks[t];
+            csv::for_each_line(&ev_maps[c.file][c.start..c.end], |line| {
+                let Some(f) = csv::split_fields::<7>(line) else { return };
+                if f[0].is_empty() {
+                    return;
+                }
+                let ek = pack(f[0]);
+                let ingest = parse_ts(f[3]).unwrap_or(i64::MAX);
+                let mut r = RawEv { ek, user: 0, ingest, ts: 0, price: 0, cat: 0, kind: 0 };
+                validate_event(&mut r, &f, &lk);
+                bufs[part_of(ek)].push(r);
+            });
+        });
+        (links.join().expect("links thread panicked"), raw)
     });
     let raw_parts = transpose(raw);
-    lap("events parsed");
+    lap(&format!("events parsed; links: {} linked ids", persons.len));
 
     // Dedup per event_id partition: keep the min-ingest copy, then drop it if invalid.
     let ev_out = par::parallel_for(ncpu, P, || new_bufs::<Ev>(cap), |out, p| {
         let pieces = take(&raw_parts[p]);
-        let n: usize = pieces.iter().map(Vec::len).sum();
+        let mut offsets = Vec::with_capacity(pieces.len());
+        let mut n = 0usize;
+        for piece in &pieces {
+            offsets.push(n);
+            n += piece.len();
+        }
+        // ek -> (piece, index) of the min-ingest copy so far; every other copy is marked lost.
         let mut best: KeyMap<u64> = key_map(n);
+        let mut lost = vec![0u64; n.div_ceil(64) + 1];
         for (pi, piece) in pieces.iter().enumerate() {
             for (i, r) in piece.iter().enumerate() {
                 let code = ((pi as u64) << 32) | i as u64;
@@ -529,20 +548,32 @@ fn run() -> Result<()> {
                     }
                     Entry::Occupied(mut e) => {
                         let c = *e.get();
-                        if r.ingest < pieces[(c >> 32) as usize][(c & 0xFFFF_FFFF) as usize].ingest {
+                        let (cp, ci) = ((c >> 32) as usize, (c & 0xFFFF_FFFF) as usize);
+                        let loser = if r.ingest < pieces[cp][ci].ingest {
                             e.insert(code);
-                        }
+                            offsets[cp] + ci
+                        } else {
+                            offsets[pi] + i
+                        };
+                        lost[loser >> 6] |= 1 << (loser & 63);
                     }
                 }
             }
         }
-        for &c in best.values() {
-            let r = &pieces[(c >> 32) as usize][(c & 0xFFFF_FFFF) as usize];
-            if r.kind == 0 {
-                continue;
+        drop(best);
+        for (pi, piece) in pieces.iter().enumerate() {
+            let base = offsets[pi];
+            for (i, r) in piece.iter().enumerate() {
+                if let Some(ahead) = piece.get(i + AHEAD) {
+                    persons.prefetch(ahead.user);
+                }
+                let flat = base + i;
+                if r.kind == 0 || lost[flat >> 6] & (1 << (flat & 63)) != 0 {
+                    continue;
+                }
+                let person = persons.resolve(r.user);
+                out[part_of(person)].push(Ev { person, ts: r.ts, price: r.price, cat: r.cat, purchase: r.kind == 2 });
             }
-            let person = persons.resolve(r.user);
-            out[part_of(person)].push(Ev { person, ts: r.ts, price: r.price, cat: r.cat, purchase: r.kind == 2 });
         }
     });
     drop(raw_parts);
@@ -553,8 +584,10 @@ fn run() -> Result<()> {
     let ck_chunks = csv::chunks(&ck_maps, CHUNK);
     let ck_cap = ck_bytes / 45 / (ncpu * P) * 5 / 4 + 16;
     let click_window_start = lk.ws - WEEK_MS;
-    let clicks = par::parallel_for(ncpu, ck_chunks.len(), || new_bufs::<Click>(ck_cap), |bufs, t| {
+    let clicks = par::parallel_for(ncpu, ck_chunks.len(), || (new_bufs::<Click>(ck_cap), Vec::new()), |state, t| {
+        let (bufs, batch): &mut (Vec<Vec<Click>>, Vec<Click>) = state;
         let c = &ck_chunks[t];
+        batch.clear();
         csv::for_each_line(&ck_maps[c.file][c.start..c.end], |line| {
             let Some([cid, uid, camp, tsf]) = csv::split_fields::<4>(line) else { return };
             if cid.is_empty() || uid.is_empty() {
@@ -565,10 +598,18 @@ fn run() -> Result<()> {
                 return;
             }
             let Some(ci) = lk.campaign(camp) else { return };
-            let person = persons.resolve(pack(uid));
-            bufs[part_of(person)].push(Click { person, ck: pack(cid), ts: t, camp: ci });
+            batch.push(Click { person: pack(uid), ck: pack(cid), ts: t, camp: ci });
         });
+        for i in 0..batch.len() {
+            if let Some(ahead) = batch.get(i + AHEAD) {
+                persons.prefetch(ahead.person);
+            }
+            let mut click = batch[i];
+            click.person = persons.resolve(click.person);
+            bufs[part_of(click.person)].push(click);
+        }
     });
+    let clicks: Vec<Vec<Vec<Click>>> = clicks.into_iter().map(|(bufs, _)| bufs).collect();
     let ck_parts = transpose(clicks);
     lap("clicks parsed");
 

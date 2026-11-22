@@ -28,7 +28,7 @@ define native_run
 endef
 
 .PHONY: help bin build fixtures fixtures-local test dev bench-data seed run-dev run-dev-local \
-        check-dev run-bench run-bench-local final-data run-final-local gate venv clean-out
+        check-dev check-seeds run-bench run-bench-local final-data run-final-local gate venv clean-out
 
 help:          ## List targets
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | sed 's/:.*## /\t/' | expand -t 18
@@ -47,7 +47,10 @@ fixtures-local: bin ## Run the 36 fixtures with the native binary (fast loop)
 fixtures: build ## Run the 36 fixtures in the image with scorer flags
 	$(PY) scripts/run_fixtures.py $(FIXTURES) -- scripts/docker_run.sh
 
-test: fixtures-local run-dev-local check-dev ## Fast correctness gate: fixtures + dev-set exact diff (native)
+test: fixtures-local run-dev-local check-dev check-seeds ## Fast correctness gate: fixtures + dev diff + reference seeds (native)
+
+check-seeds: bin  ## Diff native output vs reference answers in seeds/sN-ref
+	scripts/check_seeds.sh
 
 $(GEN):
 	cd tools/generator && cargo build --release

@@ -142,3 +142,110 @@ mod tests {
         assert_eq!(to_vec(pack(b"u1 ")), b"u1 ".to_vec());
     }
 }
+
+/// Open-addressing `u128 -> u128` map (linear probing, load <= 0.5) with software
+/// prefetch, for the hot person lookups. Key 0 (the empty string) is the empty marker
+/// and is never stored: every stored key is a non-empty string.
+pub struct FlatMap {
+    mask: usize,
+    slots: Vec<(u128, u128)>,
+}
+
+impl FlatMap {
+    pub fn with_capacity(n: usize) -> Self {
+        let cap = (n * 2).next_power_of_two().max(16);
+        FlatMap { mask: cap - 1, slots: vec![(0, 0); cap] }
+    }
+
+    #[inline]
+    fn slot(&self, k: u128) -> usize {
+        (mix(k) as usize) & self.mask
+    }
+
+    #[allow(dead_code)]
+    pub fn insert(&mut self, k: u128, v: u128) {
+        assert!(k != 0, "FlatMap: key 0 is reserved");
+        let mut i = self.slot(k);
+        loop {
+            let s = &mut self.slots[i];
+            if s.0 == 0 || s.0 == k {
+                *s = (k, v);
+                return;
+            }
+            i = (i + 1) & self.mask;
+        }
+    }
+
+    /// The value for `k`, inserting `v` first if `k` is absent.
+    #[inline]
+    pub fn get_or_insert(&mut self, k: u128, v: u128) -> u128 {
+        assert!(k != 0, "FlatMap: key 0 is reserved");
+        let mut i = self.slot(k);
+        loop {
+            let s = &mut self.slots[i];
+            if s.0 == k {
+                return s.1;
+            }
+            if s.0 == 0 {
+                *s = (k, v);
+                return v;
+            }
+            i = (i + 1) & self.mask;
+        }
+    }
+
+    pub fn values_mut(&mut self) -> impl Iterator<Item = &mut u128> {
+        self.slots.iter_mut().filter(|s| s.0 != 0).map(|s| &mut s.1)
+    }
+
+    #[inline]
+    pub fn get(&self, k: u128) -> Option<u128> {
+        let mut i = self.slot(k);
+        loop {
+            let s = self.slots[i];
+            if s.0 == 0 {
+                return None;
+            }
+            if s.0 == k {
+                return Some(s.1);
+            }
+            i = (i + 1) & self.mask;
+        }
+    }
+
+    #[inline]
+    pub fn prefetch(&self, k: u128) {
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: slot() is always < slots.len(); prefetch never faults.
+        unsafe {
+            use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+            _mm_prefetch::<_MM_HINT_T0>(self.slots.as_ptr().add(self.slot(k)) as *const i8);
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        let _ = k;
+    }
+}
+
+#[cfg(test)]
+mod flat_tests {
+    use super::*;
+
+    #[test]
+    fn flat_map() {
+        let mut m = FlatMap::with_capacity(1000);
+        for i in 1..=1000u128 {
+            m.insert(pack(format!("u{i}").as_bytes()), i);
+        }
+        for i in 1..=1000u128 {
+            assert_eq!(m.get(pack(format!("u{i}").as_bytes())), Some(i));
+        }
+        assert_eq!(m.get(pack(b"nope")), None);
+        assert_eq!(m.get(0), None);
+        m.insert(pack(b"u5"), 7);
+        assert_eq!(m.get(pack(b"u5")), Some(7));
+        assert_eq!(m.get_or_insert(pack(b"u5"), 9), 7);
+        assert_eq!(m.get_or_insert(pack(b"new"), 9), 9);
+        assert_eq!(m.get(pack(b"new")), Some(9));
+        assert_eq!(m.values_mut().count(), 1001);
+    }
+}
