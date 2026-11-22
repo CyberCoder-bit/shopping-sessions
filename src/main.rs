@@ -496,11 +496,9 @@ fn run() -> Result<()> {
             let mut pairs: Vec<(u128, u128)> = Vec::new();
             for map in &ln_maps {
                 let Some(header_end) = memchr::memchr(b'\n', map) else { continue };
-                csv::for_each_line(&map[header_end + 1..], |line| {
-                    if let Some([a, b]) = csv::split_fields::<2>(line) {
-                        if !a.is_empty() && !b.is_empty() {
-                            pairs.push((pack(a), pack(b)));
-                        }
+                csv::for_each_record::<2>(&map[header_end + 1..], |&[a, b]| {
+                    if !a.is_empty() && !b.is_empty() {
+                        pairs.push((pack(a), pack(b)));
                     }
                 });
             }
@@ -510,15 +508,14 @@ fn run() -> Result<()> {
         });
         let raw = par::parallel_for(ncpu, ev_chunks.len(), || new_bufs::<RawEv>(cap), |bufs, t| {
             let c = &ev_chunks[t];
-            csv::for_each_line(&ev_maps[c.file][c.start..c.end], |line| {
-                let Some(f) = csv::split_fields::<7>(line) else { return };
+            csv::for_each_record::<7>(&ev_maps[c.file][c.start..c.end], |f| {
                 if f[0].is_empty() {
                     return;
                 }
                 let ek = pack(f[0]);
                 let ingest = parse_ts(f[3]).unwrap_or(i64::MAX);
                 let mut r = RawEv { ek, user: 0, ingest, ts: 0, price: 0, cat: 0, kind: 0 };
-                validate_event(&mut r, &f, &lk);
+                validate_event(&mut r, f, &lk);
                 bufs[part_of(ek)].push(r);
             });
         });
@@ -588,8 +585,7 @@ fn run() -> Result<()> {
         let (bufs, batch): &mut (Vec<Vec<Click>>, Vec<Click>) = state;
         let c = &ck_chunks[t];
         batch.clear();
-        csv::for_each_line(&ck_maps[c.file][c.start..c.end], |line| {
-            let Some([cid, uid, camp, tsf]) = csv::split_fields::<4>(line) else { return };
+        csv::for_each_record::<4>(&ck_maps[c.file][c.start..c.end], |&[cid, uid, camp, tsf]| {
             if cid.is_empty() || uid.is_empty() {
                 return;
             }

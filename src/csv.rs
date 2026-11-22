@@ -119,6 +119,68 @@ pub fn split_fields<const N: usize>(line: &[u8]) -> Option<[&[u8]; N]> {
     Some(out)
 }
 
+/// Calls `f` with the `N` unquoted fields of every well-formed line of `data` (a chunk of
+/// whole lines, header already skipped), in one SIMD pass over `,`, `\n` and `"`.
+/// Same dialect as `for_each_line` + `split_fields`: lines end at `\n` only; a field is
+/// either `"..."` with no inner quote (unwrapped) or has no quote; a wrong field count,
+/// an empty line or a misplaced quote drops the line.
+#[inline]
+#[allow(unused_assignments)] // the macro's bookkeeping after the very last field
+pub fn for_each_record<const N: usize>(data: &[u8], mut f: impl FnMut(&[&[u8]; N])) {
+    let mut fields: [&[u8]; N] = [&[]; N];
+    let mut nf = 0usize; // index of the current field in the line
+    let mut fs = 0usize; // start of the current field
+    let mut ok = true; // line still well-formed
+    let mut quotes = 0u32; // quotes in the current field
+    let mut q_first = 0usize;
+    let mut q_last = 0usize;
+    macro_rules! end_field {
+        ($pos:expr) => {{
+            let pos = $pos;
+            if ok {
+                if nf >= N {
+                    ok = false;
+                } else if quotes == 0 {
+                    fields[nf] = &data[fs..pos];
+                } else if quotes == 2 && q_first == fs && q_last + 1 == pos && pos - fs >= 2 {
+                    fields[nf] = &data[fs + 1..pos - 1];
+                } else {
+                    ok = false;
+                }
+            }
+            nf += 1;
+            fs = pos + 1;
+            quotes = 0;
+        }};
+    }
+    for pos in memchr::memchr3_iter(b',', b'\n', b'"', data) {
+        match data[pos] {
+            b'"' => {
+                if quotes == 0 {
+                    q_first = pos;
+                }
+                q_last = pos;
+                quotes += 1;
+            }
+            b',' => end_field!(pos),
+            _ => {
+                end_field!(pos);
+                if ok && nf == N {
+                    f(&fields);
+                }
+                nf = 0;
+                ok = true;
+            }
+        }
+    }
+    if fs < data.len() || nf > 0 {
+        end_field!(data.len());
+        if ok && nf == N {
+            f(&fields);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -135,5 +197,39 @@ mod tests {
         assert_eq!(split_fields::<2>(b"a,\"b\"c"), None);
         assert_eq!(split_fields::<2>(b"a,\"b\"\"c\""), None);
         assert_eq!(split_fields::<2>(b" a ,b\r"), Some([&b" a "[..], &b"b\r"[..]]));
+    }
+
+    fn same<const N: usize>(data: &[u8]) {
+        let mut a: Vec<[Vec<u8>; N]> = Vec::new();
+        for_each_line(data, |l| {
+            if let Some(f) = split_fields::<N>(l) {
+                a.push(f.map(|x| x.to_vec()));
+            }
+        });
+        let mut b: Vec<[Vec<u8>; N]> = Vec::new();
+        for_each_record::<N>(data, |f| b.push((*f).map(|x| x.to_vec())));
+        assert_eq!(a, b, "{:?}", String::from_utf8_lossy(data));
+    }
+
+    #[test]
+    fn scanner_matches_split_fields() {
+        let alphabet = b"ab,\"\n \r";
+        let mut seed = 0x1234_5678_9abc_def0u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for _ in 0..200_000 {
+            let len = (next() % 64) as usize;
+            let data: Vec<u8> = (0..len).map(|_| alphabet[(next() % alphabet.len() as u64) as usize]).collect();
+            same::<2>(&data);
+            same::<4>(&data);
+            same::<7>(&data);
+        }
+        for d in [&b""[..], b"\n", b"a,b", b"a,b\n", b"a,b\n\n", b"\"a\",\"\"", b"a,\"", b",", b",\n,"] {
+            same::<2>(d);
+        }
     }
 }
