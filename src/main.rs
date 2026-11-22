@@ -234,7 +234,7 @@ fn build_persons(pairs: &[(u128, u128)]) -> Persons {
     let mut keys_of: Vec<u128> = Vec::with_capacity(pairs.len() + 16);
     let mut parent: Vec<u32> = Vec::with_capacity(pairs.len() + 16);
     let mut size: Vec<u32> = Vec::with_capacity(pairs.len() + 16);
-    let mut id_of = |k: u128, keys_of: &mut Vec<u128>, parent: &mut Vec<u32>, size: &mut Vec<u32>| -> u32 {
+    fn id_of(map: &mut FlatMap, keys_of: &mut Vec<u128>, parent: &mut Vec<u32>, size: &mut Vec<u32>, k: u128) -> u32 {
         let next = keys_of.len() as u32;
         let id = map.get_or_insert(k, next as u128) as u32;
         if id == next {
@@ -243,10 +243,14 @@ fn build_persons(pairs: &[(u128, u128)]) -> Persons {
             size.push(1);
         }
         id
-    };
-    for &(a, b) in pairs {
-        let ia = id_of(a, &mut keys_of, &mut parent, &mut size);
-        let ib = id_of(b, &mut keys_of, &mut parent, &mut size);
+    }
+    for (i, &(a, b)) in pairs.iter().enumerate() {
+        if let Some(&(pa, pb)) = pairs.get(i + AHEAD) {
+            map.prefetch(pa);
+            map.prefetch(pb);
+        }
+        let ia = id_of(&mut map, &mut keys_of, &mut parent, &mut size, a);
+        let ib = id_of(&mut map, &mut keys_of, &mut parent, &mut size, b);
         let ra = find(&mut parent, ia);
         let rb = find(&mut parent, ib);
         if ra != rb {
@@ -548,6 +552,17 @@ fn prefix_sums(v: &mut Vec<usize>) -> usize {
     total
 }
 
+/// Drops the pages of fully parsed input mappings, in parallel (MADV_DONTNEED only takes
+/// the mmap lock for reading), so the serial teardown at exit has less to unmap. Nothing
+/// points into these mappings afterwards: parsed records hold packed keys, not slices.
+fn release(ncpu: usize, maps: &[Mmap]) {
+    par::parallel_for(ncpu, maps.len(), || (), |_, i| {
+        // SAFETY: the mapping is private and read-only, and is never read again; if it
+        // were, the pages would simply fault back in from the page cache.
+        let _ = unsafe { maps[i].unchecked_advise(memmap2::UncheckedAdvice::DontNeed) };
+    });
+}
+
 fn run() -> Result<()> {
     let t0 = Instant::now();
     let lap = |what: &str| eprintln!("[{:8.3}s] {what}", t0.elapsed().as_secs_f64());
@@ -606,6 +621,7 @@ fn run() -> Result<()> {
         (links.join().expect("links thread panicked"), raw)
     });
     let raw_parts = transpose(raw);
+    release(ncpu, &ev_maps);
     lap(&format!("events parsed; links: {} linked ids", persons.len));
 
     // Dedup per event_id partition: keep the min-ingest copy, then drop it if invalid.
@@ -691,6 +707,7 @@ fn run() -> Result<()> {
     });
     let clicks: Vec<Vec<Vec<Click>>> = clicks.into_iter().map(|(bufs, _)| bufs).collect();
     let ck_parts = transpose(clicks);
+    release(ncpu, &ck_maps);
     lap("clicks parsed");
 
     // Sessions, credit and assists per person partition.
