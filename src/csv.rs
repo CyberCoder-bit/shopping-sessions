@@ -119,64 +119,116 @@ pub fn split_fields<const N: usize>(line: &[u8]) -> Option<[&[u8]; N]> {
     Some(out)
 }
 
-/// Calls `f` with the `N` unquoted fields of every well-formed line of `data` (a chunk of
-/// whole lines, header already skipped), in one SIMD pass over `,`, `\n` and `"`.
-/// Same dialect as `for_each_line` + `split_fields`: lines end at `\n` only; a field is
-/// either `"..."` with no inner quote (unwrapped) or has no quote; a wrong field count,
-/// an empty line or a misplaced quote drops the line.
-#[inline]
-#[allow(unused_assignments)] // the macro's bookkeeping after the very last field
-pub fn for_each_record<const N: usize>(data: &[u8], mut f: impl FnMut(&[&[u8]; N])) {
-    let mut fields: [&[u8]; N] = [&[]; N];
-    let mut nf = 0usize; // index of the current field in the line
-    let mut fs = 0usize; // start of the current field
-    let mut ok = true; // line still well-formed
-    let mut quotes = 0u32; // quotes in the current field
-    let mut q_first = 0usize;
-    let mut q_last = 0usize;
-    macro_rules! end_field {
-        ($pos:expr) => {{
-            let pos = $pos;
-            if ok {
-                if nf >= N {
-                    ok = false;
-                } else if quotes == 0 {
-                    fields[nf] = &data[fs..pos];
-                } else if quotes == 2 && q_first == fs && q_last + 1 == pos && pos - fs >= 2 {
-                    fields[nf] = &data[fs + 1..pos - 1];
-                } else {
-                    ok = false;
-                }
+/// Line/field state of `for_each_record`, advanced one delimiter (`,` `\n` `"`) at a time.
+struct Scan<'a, const N: usize> {
+    data: &'a [u8],
+    fields: [&'a [u8]; N],
+    nf: usize,      // index of the current field in the line
+    fs: usize,      // start of the current field
+    ok: bool,       // line still well-formed
+    quotes: u32,    // quotes in the current field
+    q_first: usize, // position of its first quote
+    q_last: usize,  // position of its last quote
+}
+
+impl<'a, const N: usize> Scan<'a, N> {
+    #[inline(always)]
+    fn end_field(&mut self, pos: usize) {
+        if self.ok {
+            if self.nf >= N {
+                self.ok = false;
+            } else if self.quotes == 0 {
+                self.fields[self.nf] = &self.data[self.fs..pos];
+            } else if self.quotes == 2 && self.q_first == self.fs && self.q_last + 1 == pos && pos - self.fs >= 2 {
+                self.fields[self.nf] = &self.data[self.fs + 1..pos - 1];
+            } else {
+                self.ok = false;
             }
-            nf += 1;
-            fs = pos + 1;
-            quotes = 0;
-        }};
+        }
+        self.nf += 1;
+        self.fs = pos + 1;
+        self.quotes = 0;
     }
-    for pos in memchr::memchr3_iter(b',', b'\n', b'"', data) {
-        match data[pos] {
+
+    /// `pos` holds a `,`, `\n` or `"`.
+    #[inline(always)]
+    fn delimiter(&mut self, pos: usize, f: &mut impl FnMut(&[&'a [u8]; N])) {
+        match self.data[pos] {
             b'"' => {
-                if quotes == 0 {
-                    q_first = pos;
+                if self.quotes == 0 {
+                    self.q_first = pos;
                 }
-                q_last = pos;
-                quotes += 1;
+                self.q_last = pos;
+                self.quotes += 1;
             }
-            b',' => end_field!(pos),
+            b',' => self.end_field(pos),
             _ => {
-                end_field!(pos);
-                if ok && nf == N {
-                    f(&fields);
+                self.end_field(pos);
+                if self.ok && self.nf == N {
+                    f(&self.fields);
                 }
-                nf = 0;
-                ok = true;
+                self.nf = 0;
+                self.ok = true;
             }
         }
     }
-    if fs < data.len() || nf > 0 {
-        end_field!(data.len());
-        if ok && nf == N {
-            f(&fields);
+}
+
+/// Bit i set iff `p[i]` is `,`, `\n` or `"`, for the 32 bytes at `p`.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline(always)]
+fn delimiter_mask(block: &[u8; 32]) -> u32 {
+    use std::arch::x86_64::*;
+    // SAFETY: AVX2 is enabled at compile time (target-cpu=x86-64-v3); the load reads
+    // exactly the 32 bytes of `block`.
+    unsafe {
+        let v = _mm256_loadu_si256(block.as_ptr() as *const __m256i);
+        let c = _mm256_cmpeq_epi8(v, _mm256_set1_epi8(b',' as i8));
+        let l = _mm256_cmpeq_epi8(v, _mm256_set1_epi8(b'\n' as i8));
+        let q = _mm256_cmpeq_epi8(v, _mm256_set1_epi8(b'"' as i8));
+        _mm256_movemask_epi8(_mm256_or_si256(_mm256_or_si256(c, l), q)) as u32
+    }
+}
+
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+#[inline(always)]
+fn delimiter_mask(block: &[u8; 32]) -> u32 {
+    let mut m = 0u32;
+    for (i, &b) in block.iter().enumerate() {
+        if b == b',' || b == b'\n' || b == b'"' {
+            m |= 1 << i;
+        }
+    }
+    m
+}
+
+/// Calls `f` with the `N` unquoted fields of every well-formed line of `data` (a chunk of
+/// whole lines, header already skipped). One pass: a 32-byte SIMD compare finds every
+/// `,` `\n` `"`, and the set bits are walked in order (dense matches, so no per-match
+/// re-search). Same dialect as `for_each_line` + `split_fields`: lines end at `\n` only;
+/// a field is either `"..."` with no inner quote (unwrapped) or has no quote; a wrong
+/// field count, an empty line or a misplaced quote drops the line.
+#[inline]
+pub fn for_each_record<'a, const N: usize>(data: &'a [u8], mut f: impl FnMut(&[&'a [u8]; N])) {
+    let mut st = Scan::<N> { data, fields: [&[]; N], nf: 0, fs: 0, ok: true, quotes: 0, q_first: 0, q_last: 0 };
+    let mut base = 0;
+    while let Some(block) = data.get(base..base + 32) {
+        let mut m = delimiter_mask(block.try_into().expect("32-byte block"));
+        while m != 0 {
+            st.delimiter(base + m.trailing_zeros() as usize, &mut f);
+            m &= m - 1;
+        }
+        base += 32;
+    }
+    for pos in base..data.len() {
+        if matches!(data[pos], b',' | b'\n' | b'"') {
+            st.delimiter(pos, &mut f);
+        }
+    }
+    if st.fs < data.len() || st.nf > 0 {
+        st.end_field(data.len());
+        if st.ok && st.nf == N {
+            f(&st.fields);
         }
     }
 }
@@ -222,7 +274,7 @@ mod tests {
             seed
         };
         for _ in 0..200_000 {
-            let len = (next() % 64) as usize;
+            let len = (next() % 200) as usize;
             let data: Vec<u8> = (0..len).map(|_| alphabet[(next() % alphabet.len() as u64) as usize]).collect();
             same::<2>(&data);
             same::<4>(&data);
